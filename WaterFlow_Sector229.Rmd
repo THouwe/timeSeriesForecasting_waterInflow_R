@@ -1,0 +1,389 @@
+---
+title: "WaterFlow_Sector229"
+author: "Thomas Houweling"
+date: "10/8/2022"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Intro
+Per eseguire, cambia directory nella linea di codice nella cella in basso con la directory contenente il file 'flow (1).csv' e specifica se (i) multicore o no (Se si possiamo specificare modelli piu' complessi), (ii) salvare le immagini (5 o 6 per ciascun settore), (iii) salvare i dati (dati puliti, modello e forecast).
+
+```{r startup, echo=FALSE}
+myDir <- ('C:/Users/Houwelin2/Desktop/SDG_homework_TS/')
+multiCore <- FALSE
+saveImgs <- FALSE
+saveData <- TRUE
+```
+
+## Librerie
+Useremo soprattutto zoo, tsibble e fable. Purtroppo questi pacchetti hanno molte funzioni con nomi simili (viva la fantasia!), creando quindi problemi di masking.
+Pertanto, carichiamo solo due librerie e per il resto chiamiamo esplicitamente il pacchetto quando esequiamo una funzione ambigua.
+Prima, installiamo le librerie mancanti.
+
+```{r load libraries, echo=FALSE}
+if(!require("ggplot2")){
+  install.packages("ggplot2")
+  library("ggplot2")
+}
+
+if(!require("dplyr")){
+  install.packages("dplyr")
+  library("dplyr")
+}
+
+####
+
+if(!require("zoo")){
+  install.packages("zoo")
+  detach("zoo")
+}
+
+if(!require("lubridate")){
+  install.packages("lubridate")
+  detach("lubridate")
+}
+
+if(!require("forecast")){
+  install.packages("forecast")
+  detach("forecast")
+}
+
+if(!require("fable")){
+  install.packages("fable")
+  detach("fable")
+}
+
+if(!require("scales")){
+  install.packages("scales")
+  detach("scales")
+}
+
+if(!require("stats")){
+  install.packages("stats")
+  detach("stats")
+}
+
+if(!require("readr")){
+  install.packages("readr")
+  detach("readr")
+}
+```
+
+## Carica dataset
+In questo file esploriamo il primo settore nel dataset (settore 229) a titolo esemplificativo.
+
+```{r read file, echo=FALSE}
+df <- read.csv(paste0(myDir, 'flow (1).csv'))
+id <- unique(df$id_sector)
+i <- 1
+outDir <- paste0(myDir,'sector_', as.character(id[i]), '/')
+
+d <- df[df$id_sector == id[i],]
+d$utc <- as.POSIXct(d$ts_measurement, tz = "UTC")
+```
+
+## Regolarizzazione TS
+I dati sono irregolari. Per creare time series (TS) regolari uso il pacchetto zoo.
+
+```{r regularize TS, echo=FALSE}
+#### create zoo object (period = 15 min)
+z <- zoo::zoo(d$flow, as.POSIXct(d$ts_measurement, tz = "UTC"))
+reg <- seq(min(d$utc), max(d$utc), by = "15 min")
+zr <- zoo::zoo(1:length(z), reg)
+zm <- merge(zr, z, all = TRUE)
+
+#### Agrregate over hours
+zh <-
+  aggregate(zm$z,
+            by = lubridate::floor_date(zoo::index(zm), unit = "1 hour"),
+            FUN = mean)
+
+DFh <- data.frame(time = zoo::index(zh), 
+                  values = zoo::coredata(zh))
+
+#### plot data
+if (saveImgs == TRUE) {
+  pdf(file = paste0(outDir,'sector_',as.character(id[i]),'_hourlyData.pdf'),
+    width = 4, height = 4)
+}
+ggplot(DFh, aes(time, values)) +
+  geom_line() + 
+  xlab("Time (year)") + ylab("Water Flow (o.u.)") +
+  ggtitle(paste0("Sector ",as.character(id[i]),": Hourly Data"))
+if (saveImgs == TRUE) {
+  dev.off()
+}
+```
+
+## Pulizia dataset
+Dall'immagine possiamo notare come vi siano larghi chunk di dati mancanti prima di Febbraio/Marzo 2019 e piccoli chunck di dati mancanti successivamente. Iniziamo rimuovendo i dati iniziali. 
+
+```{r trim, echo=FALSE}
+#### trim
+idxna <- which(is.na(zoo::coredata(zh))) # find index of missing values
+naseq <-
+  unname(tapply(idxna, cumsum(c(1, diff(
+    idxna
+  )) != 1), range)) # get ranges of missing values segments
+
+seqLen <- replicate(nrow(naseq), 0)
+for (j in 1:nrow(naseq)) {
+  seqLen[j] <- naseq[[j]][2] - naseq[[j]][1]
+}
+
+# length(seqLen[seqLen > 1000]) # 2 large sequences
+# which(seqLen > 1000) # indices of the sequences (1 & 26)
+# > naseq[[26]]
+# [1] 1443 3030
+# > naseq[[1]]
+# [1]    2 1319
+zh <- zh[-(1:naseq[[26]][2])] # remove observations & plot
+
+#### plot trimmed data
+DFh <- data.frame(time = zoo::index(zh),
+                  values = zoo::coredata(zh))
+
+if (saveImgs == TRUE) {
+  pdf(file = paste0(outDir,'sector_',as.character(id[i]),'_hourlyDataTrimmed.pdf'),
+      width = 4, height = 4)
+}
+
+ggplot(DFh, aes(time, values)) +
+  geom_line() + 
+  xlab("Time (year)") + ylab("Water Flow (o.u.)") +
+  ggtitle(paste0("Sector ",as.character(id[i]),": Hourly Data Trimmed"))
+
+if (saveImgs == TRUE) {
+  dev.off()
+}
+```
+
+Molto meglio. Successivamente, interpoliamo i dati mancanti. Piuttosto che usare funzioni pre-compute (e.g., zoo::na.locf), scriviamo qualche linea di codice. Questo perche' i dati sono estremamente variabili (noisy) e pertanto e' meglio interpolare usando grandi chuncks di dati prima e dopo quelli mancanti. Specificamente, usiamo la media di tutti i valori nei 5 giorni antecedenti e successivi ai dati mancanti.
+
+```{r impute, echo=FALSE}
+coreVals <- zoo::coredata(zh)
+idxna2 <- which(is.na(coreVals))
+naseq2 <-
+  unname(tapply(idxna2, cumsum(c(1, diff(idxna2)) != 1),
+                range)) # get ranges of missing values segments
+vals2replace <- replicate(nrow(naseq2), -99)
+for (j in 1:nrow(naseq2)) {
+  if (naseq2[[j]][1] > 4*24*5 && naseq2[[j]][2] < length(coreVals) - (4*24*5)) {
+    IDXstart1 <- naseq2[[j]][1] - (4*24*5)
+    IDXend1 <- naseq2[[j]][1] - 1
+    IDXstart2 <- naseq2[[j]][2] + 1
+    IDXend2 <- naseq2[[j]][2] + (4*24*5)
+    
+    vals2replace[j] <- mean(c(
+      coreVals[IDXstart1:IDXend1],
+      coreVals[IDXstart2:IDXend2]
+    ),
+    na.rm = TRUE)
+  }
+}
+
+TS <- zoo::na.approx(zh)
+for (j in 1:length(vals2replace)) {
+  if (vals2replace[j] != -99) { # here we replace with better estimates (when possible)
+    # print('replacing...') # very slow computing
+    startIDX <- naseq2[[j]][1]
+    endIDX <- naseq2[[j]][2]
+    TS[startIDX:endIDX] <- vals2replace[j]
+    # zm$flow[naseq2[[j]][1]:naseq2[[j]][2]] <- vals2replace[j]
+  }
+}
+
+#### plot trimmed data
+DFh <- data.frame(time = zoo::index(TS),
+                  values = zoo::coredata(TS))
+
+if (saveImgs == TRUE) {
+  pdf(file = paste0(outDir,'sector_',as.character(id[i]),'_hourlyDataTrimmedImputed.pdf'),
+      width = 4, height = 4)
+}
+
+ggplot(DFh, aes(time, values)) +
+  geom_line() + 
+  xlab("Time (year)") + ylab("Water Flow (o.u.)") +
+  ggtitle(paste0("Sector ",as.character(id[i]),": Hourly Data Imputed"))
+
+if (saveImgs == TRUE) {
+  dev.off()
+}
+```
+
+## Data Inspection
+Dopo un minimo di pulizia iniziale, siamo pronti a ispezionare la nostra TS per stagionalita' e trends.
+La ciclicita' annuale e' apparente. Ci possono pero' essere anche stagionalita' settimanali, diurne, ecc...
+In piu' puo' esserci un long-term trend (lineare o non lineare).
+Visualizziamo delle moving averages per vedere se ci sono long-term trends.
+
+```{r MAs, echo=FALSE}
+flow_m_01h <- zoo::rollmean(TS, 1, fill = NA)
+flow_m_03h <- zoo::rollmean(TS, 3, fill = NA)
+flow_m_01d <- zoo::rollmean(TS, 24, fill = NA)
+flow_m_03d <- zoo::rollmean(TS, 24*3, fill = NA)
+flow_m_05d <- zoo::rollmean(TS, 24*5, fill = NA)
+flow_m_01w <- zoo::rollmean(TS, 24*7, fill = NA)
+flow_m_03w <- zoo::rollmean(TS, 24*21, fill = NA)
+flow_m_01m <- zoo::rollmean(TS, 24*30, fill = NA)
+flow_m_01y <- zoo::rollmean(TS, 24*365, fill = NA)
+
+# convert to data frame to plot with ggplot
+dayTime <- zoo::index(TS)
+values <- zoo::coredata(TS)
+ma_01h <- zoo::coredata(flow_m_01h)
+ma_03h <- zoo::coredata(flow_m_03h)
+ma_01d <- zoo::coredata(flow_m_01d)
+ma_03d <- zoo::coredata(flow_m_03d)
+ma_05d <- zoo::coredata(flow_m_05d)
+ma_01w <- zoo::coredata(flow_m_01w)
+ma_03w <- zoo::coredata(flow_m_03w)
+ma_01m <- zoo::coredata(flow_m_01m)
+ma_01y <- zoo::coredata(flow_m_01y)
+
+DF <- data.frame(dayTime,values,
+                 ma_01h, ma_03h,
+                 ma_01d, ma_03d, ma_05d,
+                 ma_01w, ma_03w,
+                 ma_01m,
+                 ma_01y)
+
+#### plot MAs:
+if (saveImgs == TRUE) {
+  pdf(file = paste0(outDir,'sector_',as.character(id[i]),'_MAs.pdf'),
+      width = 4, height = 4)
+}
+
+ggplot(DF, aes(dayTime)) +
+  geom_line(aes(y=values,colour="real")) +
+  # geom_line(aes(y=ma_01h,colour="1h MA")) +
+  geom_line(aes(y=ma_01d,colour="1d MA")) +
+  # geom_line(aes(y=ma_03d,colour="3d MA")) +
+  geom_line(aes(y=ma_01w,colour="1w MA")) +
+  geom_line(aes(y=ma_01m,colour="1m MA")) +
+  geom_line(aes(y=ma_01y,colour="1y MA")) + 
+  xlab("Time (year)") + ylab("Water Flow (o.u.)") +
+  ggtitle(paste0("Sector ",as.character(id[i]),": Data & Moving Averages (MA)"))
+
+if (saveImgs == TRUE) {
+  dev.off()
+}
+```
+
+Ispezionando le moving averages possiamo concludere che: ci e' una grande variabilita' intra-day, che supera di molto quella inter-day. Possiamo quindi aspettarci larghi intervalli di confidenza associati alla predizione. Le MAs di 1 settimana e 1 mese ci mostrano come la media di water flow in estate non sia realmente maggiore che di inverno di 10-20 unita' di misura, a fronte di un aumento spropositato nella variabilita' (varianza meno stazionaria della media).
+In piu', la moving average di periodo 1 anno e' piatta, suggerendo l'assenza di long-term trends.
+Ora procediamo a verificare la presenza di stagionalita' a periodo piu' breve (settimanale, diurno).
+Lo facciamo plottando il correlogramma a diversi lag.
+
+```{r ACF, echo=FALSE}
+if (saveImgs == TRUE) {
+  pdf(file = paste0(outDir,'sector_',as.character(id[i]),'_ACF_2wk.pdf'),
+      width = 4, height = 4)
+}
+
+AC <- acf(zoo::coredata(TS), plot=FALSE, lag.max = 24*15)
+plot(AC, xaxt="n", 
+     main=paste0("Sector ",as.character(id[i]),": Autocorrelation Plot"),
+     xlab="Lag (days)")
+xtick <- seq(0, 24*15, by=24)
+axis(side=1, at=xtick, labels= 0:15)
+
+if (saveImgs == TRUE) {
+  dev.off()
+}
+```
+
+Un chiarissimo pattern giornaliero e' apprezzabile, insieme a un meno significativo pattern settimanale.
+Il modello che fitteremo ai dati deve quindi contenere almeno la stagionalita' annuale e giornaliera; meglio, se contiene anche quella settimanale. Procediamo ora a selezionare e fittare il modello, usando le librerie 'tsibble' e 'fable'.
+
+## Model fit
+
+Con abbastanza risorse, e' possibile forzare un modello ARIMA con tutte e 3 le stagionalita' evidenziate precedentemente.
+Con le risorse a mia disposizione, riesco solo a fittare il modello di default che, fortunatamente, contiene le 2 maggiori stagionalita' (annuale e diurna). L'esecuzione di questa cella richiedera' un po' di tempo...
+
+```{r fit model, echo=FALSE}
+#### convert to tsibble and plot to quickly check for inconsistencies:
+df_ts <- data.frame(values, dayTime)
+df_tsib <- tsibble::as_tsibble(df_ts)
+tsibble::has_gaps(df_ts %>% tsibble::as_tsibble(., index = dayTime)) # Luckily not
+# tsibble::scan_gaps(df_ts %>% tsibble::as_tsibble(., index = dayTime))
+
+# visualize:
+df_tsib %>%
+  autoplot(values)
+
+#### set seed for reproducibility
+set.seed(i)
+
+#### model with fable:
+# if enough resources (multicore needed) run the following:
+if (multiCore == TRUE) {
+  if (!require("future")) {
+    install.packages("future.apply")
+    library("future")
+  }
+  plan(multisession)
+  fit_ts <- df_ts %>% as_tsibble(., index = dayTime) %>%
+    model(arima = ARIMA(values ~
+                          season("day") + season("week") + season("year")))
+} else {
+  fit_ts <- df_ts %>% tsibble::as_tsibble(., index = dayTime) %>%
+  fabletools::model(arima = fable::ARIMA(values))
+}
+
+#### get descriptives:
+# fit_ts %>%
+#   fabletools::glance()
+
+fit_ts %>%
+  fabletools::report()
+
+# fit_ts %>%
+#   fabletools::augment()
+```
+
+## Forecast
+
+```{r forecast, echo=FALSE}
+#### predict:
+library("fable") # finally safe to load library
+
+fc <- fit_ts %>%
+  forecast(h = "1 week")
+
+fc_ci <- hilo(fc, level = c(80, 95))
+fc_80 <- unpack_hilo(fc_ci,"80%")
+fc_80_95 <- unpack_hilo(fc_80,"95%")
+
+
+#### plot predictions:
+if (saveImgs == TRUE) {
+  pdf(file = paste0(outDir,'sector_',as.character(id[i]),'_forecast_07gg.pdf'),
+      width = 4, height = 4)
+}
+
+fc %>%
+  autoplot(df_tsib)
+
+if (saveImgs == TRUE) {
+  dev.off()
+}
+
+#### save data, model, and predictions:
+if (saveData == TRUE) {
+  save(df_ts, df_tsib, fit_ts, fc, 
+       file = paste0(outDir,'sector_',as.character(id[i]),'_model_and_predictions.RData'))
+  
+  readr::write_csv(fc_80_95,
+                 paste0(outDir,'sector_',as.character(id[i]),'_predictions.csv'))
+}
+```
+
+Come si evince dagli intervalli di confidenza, le predizioni non sono estremamente accurate, coprendo un largo range di valori.
